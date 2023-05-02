@@ -7,6 +7,7 @@ from rl4lms.envs.text_generation.logging_utils import Tracker
 from rl4lms.envs.text_generation.training_utils import (
     OnPolicyTrainer,
     SupervisedTrainer,
+    CORALTrainer
 )
 
 
@@ -42,6 +43,14 @@ def main(
             train_eval_config=config["train_evaluation"],
             tracker=tracker,
         )
+    elif "coral trainer" in config["alg"]["id"]:
+        trainer = CORALTrainer(tokenizer_config=config["tokenizer"],
+                             datapool_config=config["datapool"],
+                             train_eval_config=config["train_evaluation"],
+                             alg_config=config["alg"],
+                             tracker=tracker,
+                             margin=config["alg"]["margin"],
+                             p_plus=config["alg"]["p_plus"])
     else:
         trainer = OnPolicyTrainer(
             tokenizer_config=config["tokenizer"],

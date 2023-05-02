@@ -1,6 +1,7 @@
 from functools import partial
 from typing import Any, Dict, List
 import numpy as np
+import torch
 
 from rl4lms.data_pools.text_generation_pool import Sample
 from rl4lms.envs.text_generation.env import TextGenEnv
@@ -318,4 +319,133 @@ class SupervisedTrainer:
         # save model here - we save only the language model
         if self._tracker is not None:
             self._tracker.save_auto_model(
-                self._model)
+                self._model) 
+
+# Additional imports
+import torch
+
+from torch.nn import functional as F
+from torch.optim import Adam
+
+
+from random import random
+from transformers import AutoModelForCausalLM, top_k_top_p_filtering
+
+
+class CORALTrainer(SupervisedTrainer):
+    def __init__(self, *args, margin, p_plus, coral_loss_weight: float = 1.0, nucleus_sampling_p: float = 0.9, random_negative_sampling_p: float = 0.5, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.nucleus_sampling_p = nucleus_sampling_p
+        self.random_negative_sampling_p = random_negative_sampling_p
+        self.optimizer = Adam(self._model.parameters())
+        self.retrieval_model = self._model
+        self.margin = margin
+        self.p_plus = p_plus
+
+    def _compute_coral_loss(self, c, r, R3):
+        input_ids, attention_mask = c
+        target_ids, target_attention_mask = r
+        decoder_input_ids = target_ids[:, :-1].contiguous()
+        labels = target_ids[:, 1:].contiguous()
+        outputs = self._model(input_ids, attention_mask=attention_mask, decoder_input_ids=decoder_input_ids, use_cache=False)
+        logits = outputs.logits
+        loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), labels.view(-1), reduction='none')
+        loss = loss.view(labels.shape)
+        coral_loss = -R3 * (loss * target_attention_mask).sum(dim=-1) / target_attention_mask.sum(dim=-1)
+        return coral_loss.mean()
+
+    def _sample_negative_response(self, c):
+        if random() > self.random_negative_sampling_p:
+            # Nucleus sampling
+            input_ids, attention_mask = c
+            model = AutoModelForCausalLM.from_pretrained(self._alg_config["model_name"])
+            logits = model(input_ids, attention_mask=attention_mask).logits[:, -1, :]
+            filtered_logits = top_k_top_p_filtering(logits, top_p=self.nucleus_sampling_p)
+            r = torch.multinomial(F.softmax(filtered_logits, dim=-1), 1)
+        else:
+            # Random negative sampling
+            r = torch.randint(0, self._tokenizer.vocab_size, (input_ids.shape[0], 1)).to(input_ids.device)
+        return r
+
+    def _train_step(self, batch):
+        c, r_positive, R3 = batch
+        r_negative = self._sample_negative_response(c)
+        positive_coral_loss = self._compute_coral_loss(c, r_positive, R3)
+        negative_coral_loss = self._compute_coral_loss(c, r_negative, R3)
+        total_loss = positive_coral_loss + self.coral_loss_weight * negative_coral_loss
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        self.optimizer.step()
+        return total_loss.item()
+
+    def train_and_eval(self):
+        # Evaluate on val and test set before fine-tuning once
+        self._evaluate_on_datapools(epoch=0)
+
+        for epoch in range(1, self._train_args.num_train_epochs + 1):
+            total_loss = 0.0
+            num_batches = 0
+            for batch in tqdm(dataloader):
+                batch = {k: v.to(model.device) for k, v in batch.items()}
+                with torch.no_grad():
+                    if p_plus < np.random.rand(): # Add this line
+                        # Nucleus sampling
+                        input_ids = batch["input_ids"]
+                        generated_response = model.generate(input_ids, **generation_kwargs)
+                        
+                        # Compute response retrieval model score
+                        response_retrieval_score = compute_response_retrieval_score(input_ids, generated_response)
+                    else:
+                        generated_response = batch["labels"]
+                        response_retrieval_score = torch.zeros(batch_size, device=model.device) # Positive samples have a score of 0
+                        
+                    outputs = model(input_ids=batch["input_ids"], labels=generated_response)
+                c, r_positive, R3 = batch
+                r_negative = self._sample_negative_response(c)
+                positive_coral_loss = self._compute_coral_loss(c, r_positive, R3)
+                negative_coral_loss = self._compute_coral_loss(c, r_negative, R3)
+                loss = positive_coral_loss + self.margin* negative_coral_loss
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+                total_loss += loss.item()
+                num_batches += 1
+            average_loss = total_loss / num_batches
+            print(f"Epoch {epoch}/{self._train_args.num_train_epochs}, average loss: {average_loss}")
+
+            # Evaluate on val and test set after each epoch
+            self._evaluate_on_datapools(epoch=self._train_args.num_train_epochs)
+
+            # save model here - we save only the language model
+            if self._tracker is not None:
+                self._tracker.save_auto_model(
+                    self._model)
+
+    def _setup(self):
+        super()._setup()
+        self._trainer = Trainer(model=self._model,
+                                tokenizer=self._tokenizer,
+                                args=self._train_args,
+                                data_collator=self._trainer.data_collator,
+                                train_dataset=self._tokenized_dataset,
+                                callbacks=self._trainer.callbacks,
+                                compute_loss=self._compute_loss)  # Pass the custom loss function
+
+    def _evaluate_on_datapools(self, epoch: int,
+                           splits: List[str] = ["val", "test"]):
+        for split in splits:
+            evaluate_supervised(model=self._model,
+                                tokenizer=self._tokenizer,
+                                samples=self._samples_by_split[split],
+                                batch_size=self._eval_batch_size,
+                                max_prompt_length=self._max_prompt_length,
+                                metrics_config_dict=self._metrics_config_dict,
+                                epoch=epoch,
+                                split_name=split,
+                                tracker=self._tracker,
+                                generation_kwargs=self._gen_kwargs,
+                                p_plus=self.p_plus) # Add this line to pass p_plus
+            
+    
+
+
