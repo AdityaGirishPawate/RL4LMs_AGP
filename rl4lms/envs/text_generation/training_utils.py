@@ -333,7 +333,7 @@ from transformers import AutoModelForCausalLM, top_k_top_p_filtering
 
 
 class CORALTrainer(SupervisedTrainer):
-    def __init__(self, *args, margin, p_plus, coral_loss_weight: float = 1.0, nucleus_sampling_p: float = 0.9, random_negative_sampling_p: float = 0.5, **kwargs):
+    def __init__(self, *args, margin, p_plus, nucleus_sampling_p: float = 0.9, random_negative_sampling_p: float = 0.5, **kwargs):
         super().__init__(*args, **kwargs)
         self.nucleus_sampling_p = nucleus_sampling_p
         self.random_negative_sampling_p = random_negative_sampling_p
